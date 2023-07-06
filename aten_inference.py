@@ -21,6 +21,11 @@ def get_token_indicies(tokenizer, prompt, subseq):
         idx.extend(list(range(window_start, window_start + len(subseq))))
     return idx
 
+def normalize_tensor(x):
+    x_min = x.min()
+    x_range = x.max() - x.min()
+    return (x - x_min) / x_range
+
 respect_to = ''
 
 class AttentionMapExtractor():
@@ -48,7 +53,7 @@ class AttentionMapExtractor():
             return attn_weight
         return attn_weight @ V
     
-    def process_attention_maps(self, token_indices, positive_prompt=True):
+    def process_attention_maps(self, token_indices, positive_prompt=True, binarize_s=10):
         #2, attention heads, h, w, sequence length
         #torch.Size([2, 8, 64, 64, 77])
         batch = 1 if positive_prompt else 0
@@ -59,7 +64,14 @@ class AttentionMapExtractor():
             attention_maps_rescaled.append(rescaled)
 
         all_maps = torch.cat(attention_maps_rescaled, dim=1)
-        return torch.mean(all_maps, dim=1)
+        raw_map = torch.mean(all_maps, dim=1)
+        if binarize_s <= 0:
+            return raw_map
+        binarized_maps = []
+        for batch in raw_map:
+            binarized_maps.append(normalize_tensor(F.sigmoid(binarize_s * (normalize_tensor(batch) - 0.5))))
+        return torch.stack(binarized_maps, dim=0)
+
 
     #self, module, input, output
     def hook_fn(self, attn, hidden_states, kwargs):
@@ -127,7 +139,7 @@ class StableDiffusionPipelineCustom():
         noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
         return noise_cfg
 
-    @torch.no_grad()
+    #torch.no_grad()
     def custom_pipeline(
         self, sdp,
         prompt: Union[str, List[str]] = None,
@@ -267,7 +279,7 @@ class StableDiffusionPipelineCustom():
         timesteps = sdp.scheduler.timesteps
 
         #(Extra step) attention hooks
-        sigmas = sdp.scheduler.add_noise(torch.zeros(1,), torch.ones(1,), timesteps)
+        sigmas = sdp.scheduler.add_noise(torch.zeros(1,), torch.ones(1,), timesteps).tolist()
         attention_blocks = sdp.unet.down_blocks + [sdp.unet.mid_block] + sdp.unet.up_blocks
         attentions = ([], [])
         #A questionable fix for questionable code
@@ -285,12 +297,14 @@ class StableDiffusionPipelineCustom():
                     attentions[0].append(basicTransformerBlock.attn2)
                     attentions[1].append(map_size)
 
-        at_map_extractor = AttentionMapExtractor(attentions[0], map_height=512, map_width=512, size_hints=attentions[1])
+        at_map_extractor = AttentionMapExtractor(attentions[0], map_height=64, map_width=64, size_hints=attentions[1])
         start_steps_with_guidance = int((0.1875 * num_inference_steps) + 0.5)
         end_steps_no_guidance = num_inference_steps - (num_inference_steps // 32)
         use_guidance_steps = list(range(0, start_steps_with_guidance, 1)) + list(range(start_steps_with_guidance, end_steps_no_guidance, 2))
         save_steps = list(range(0, num_inference_steps-1, 5)) + [num_inference_steps - 1]
         token_indicies = get_token_indicies(sdp.tokenizer, prompt, respect_to)
+        target_attention_map = torch.zeros((64, 64), device=device, dtype=torch.float16)
+        target_attention_map[:32, :32] = 1.0
 
         # 5. Prepare latent variables
         num_channels_latents = sdp.unet.config.in_channels
@@ -303,7 +317,7 @@ class StableDiffusionPipelineCustom():
             device,
             generator,
             latents,
-        )
+        ).requires_grad_()
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = sdp.prepare_extra_step_kwargs(generator, eta)
@@ -313,6 +327,8 @@ class StableDiffusionPipelineCustom():
         with sdp.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
+                if i in use_guidance_steps:
+                    latents.requires_grad_()
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = sdp.scheduler.scale_model_input(latent_model_input, t)
 
@@ -323,53 +339,61 @@ class StableDiffusionPipelineCustom():
                     encoder_hidden_states=prompt_embeds,
                     cross_attention_kwargs=cross_attention_kwargs,
                     return_dict=False,
-                )[0]
+                )[0].detach()
 
-                #add_guidance = 0
-                #if i in use_guidance_steps:
-                #    pass
-
-                # perform guidance
                 if do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-                if do_classifier_free_guidance and guidance_rescale > 0.0:
-                    # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
-                    noise_pred = self.rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+                self_guidance = 0
+                if i in use_guidance_steps and do_classifier_free_guidance:
+                    self_guidance_scale = 1500 * sigmas[i]
+                    attention_map = at_map_extractor.process_attention_maps(token_indicies)[0]
+                    energy_function = F.l1_loss(attention_map, target_attention_map)
+                    self_guidance = torch.autograd.grad(energy_function, latents)[0] * self_guidance_scale
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = sdp.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
-                if i in save_steps:
-                    image = sdp.vae.decode(latents / sdp.vae.config.scaling_factor, return_dict=False)[0]
-                    do_denormalize = [True] * image.shape[0]
-                    image = sdp.image_processor.postprocess(image, do_denormalize=do_denormalize)
-                    image[0].save(f'out/sd_denoising_{i}.png')
-                    attention_map = at_map_extractor.process_attention_maps(token_indicies, True)[0]
-                    shifta = attention_map.min()
-                    shiftb = attention_map.max() - shifta
-                    attention_map = 255.0 * (attention_map - shifta) / shiftb
-                    Image.fromarray(attention_map.detach().cpu().numpy().astype(np.uint8)).save(f'out/sd_attention_{i}.png')
-                    
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % sdp.scheduler.order == 0):
-                    progress_bar.update()
-                    if callback is not None and i % callback_steps == 0:
-                        callback(i, t, latents)
+                latents = latents.detach()
 
-        if not output_type == "latent":
-            image = sdp.vae.decode(latents / sdp.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = sdp.run_safety_checker(image, device, prompt_embeds.dtype)
-        else:
-            image = latents
-            has_nsfw_concept = None
+                with torch.no_grad():
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        noise_pred = noise_pred + self_guidance
 
-        if has_nsfw_concept is None:
-            do_denormalize = [True] * image.shape[0]
-        else:
-            do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+                    if do_classifier_free_guidance and guidance_rescale > 0.0:
+                        # Based on 3.4. in https://arxiv.org/pdf/2305.08891.pdf
+                        noise_pred = self.rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
 
-        image = sdp.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents = sdp.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                    if i in save_steps:
+                        image = sdp.vae.decode(latents / sdp.vae.config.scaling_factor, return_dict=False)[0]
+                        do_denormalize = [True] * image.shape[0]
+                        image = sdp.image_processor.postprocess(image, do_denormalize=do_denormalize)
+                        image[0].save(f'out/sd_denoising_{i}.png')
+                        attention_map = at_map_extractor.process_attention_maps(token_indicies)[0] * 255.0
+                        Image.fromarray(attention_map.detach().cpu().numpy().astype(np.uint8)).resize((512, 512)).save(f'out/sd_attention_{i}.png')
+                        
+                    # call the callback, if provided
+                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % sdp.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and i % callback_steps == 0:
+                            callback(i, t, latents)
+
+        with torch.no_grad():
+            if not output_type == "latent":
+                image = sdp.vae.decode(latents / sdp.vae.config.scaling_factor, return_dict=False)[0]
+                #image, has_nsfw_concept = sdp.run_safety_checker(image, device, prompt_embeds.dtype)
+                has_nsfw_concept = None
+            else:
+                image = latents
+                has_nsfw_concept = None
+
+            if has_nsfw_concept is None:
+                do_denormalize = [True] * image.shape[0]
+            else:
+                do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
+
+            image = sdp.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
 
         # Offload last model to CPU
         if hasattr(sdp, "final_offload_hook") and sdp.final_offload_hook is not None:
@@ -390,11 +414,14 @@ def run_model(sd_prompt, sd_prompt_negative):
     sd_pipe = StableDiffusionPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5", torch_dtype=torch.float16
     ).to(device)
-    sd_pipe.scheduler = UniPCMultistepScheduler.from_config(sd_pipe.scheduler.config)
+    #sd_pipe.scheduler = UniPCMultistepScheduler.from_config(sd_pipe.scheduler.config)
 
     sd_pipe_custom = StableDiffusionPipelineCustom(sd_pipe)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(19081998)
 
-    out = sd_pipe_custom(sd_prompt, num_inference_steps=20)
+
+    out = sd_pipe_custom(sd_prompt, generator=generator, num_inference_steps=50)
 
     plt.imshow(out['images'][0])
     plt.show()
